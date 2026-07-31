@@ -13,8 +13,8 @@
 ### 機能一覧
 
 - バックアップ開始直前に Win32 API を用いてシステムスリープを一時抑止する。
-- Windows 標準バックアップコマンド `sdclt.exe /backupnow` を実行する。
-- バックアップ中は `wbengine.exe` の稼働状態を定期監視し、完了まで待機する。
+- Windows 標準バックアップコマンド `sdclt.exe /kickoffjob` を実行する。
+- バックアップ状態は `wbadmin get status` を優先して定期監視し、利用不可時は `wbengine.exe` の稼働監視へフォールバックして完了まで待機する。
 - 正常終了・異常終了を問わず、終了時にスリープ抑止状態を解除して通常状態へ復元する。
 
 ## 入力
@@ -32,10 +32,10 @@
 
 | 項目 | 内容 |
 | ---- | ---- |
-| バックアップ起動コマンド | `sdclt.exe /backupnow` |
-| 監視対象プロセス | `wbengine.exe` |
+| バックアップ起動コマンド | `sdclt.exe /kickoffjob` |
+| 監視方式 | `wbadmin get status`（優先） / `wbengine.exe` 監視（フォールバック） |
 | 監視間隔 | 5 秒（既定） |
-| 判定条件 | `wbengine.exe` が存在しなくなった時点で完了 |
+| 判定条件 | `wbadmin get status` が「実行中でない」状態、またはフォールバック時に `wbengine.exe` が存在しない状態で完了 |
 
 ## 出力
 
@@ -72,25 +72,30 @@
 
 1. アプリケーション開始ログを出力する。
 1. `SetThreadExecutionState` を呼び出し、スリープ抑止を有効化する。
-1. `sdclt.exe /backupnow` を実行してバックアップを開始する。
-1. `wbengine.exe` が起動していることを確認し、監視ループへ入る。
-1. 一定間隔で `wbengine.exe` の存在を確認し、存在する間は待機する。
-1. `wbengine.exe` の終了を検知したら完了ログを出力する。
+1. `sdclt.exe /kickoffjob` を実行してバックアップを開始する。
+1. 最大 300 秒以内にバックアップ開始を確認し、開始確認後に監視ループへ入る。
+1. 一定間隔で `wbadmin get status` を優先して確認し、利用不可時は `wbengine.exe` の存在確認へフォールバックする。
+1. バックアップが実行中でないことを検知したら完了ログを出力する。
 1. `finally` ブロックで `SetThreadExecutionState` を解除し、通常の省電力設定へ戻す。
 1. アプリケーション終了ログを出力して終了する。
 
 ```mermaid
 flowchart TD
     A[アプリケーション開始] --> B[スリープ抑止を有効化]
-    B --> C[sdclt.exe /backupnow を実行]
-    C --> D[wbengine.exe の監視開始]
-    D --> E{wbengine.exe は動作中か}
-    E -->|はい| F[5秒待機して再確認]
-    F --> E
-    E -->|いいえ| G[バックアップ完了]
-    G --> H[finally でスリープ抑止を解除]
-    H --> I[終了ログ出力]
-    I --> J[アプリケーション終了]
+    B --> C[sdclt.exe /kickoffjob を実行]
+    C --> D[開始確認を待機 最大300秒]
+    D --> E[バックアップ状態を監視]
+    E --> F{wbadminで実行中か判定できるか}
+    F -->|はい| G{実行中か}
+    F -->|いいえ| H{wbengine.exe は動作中か}
+    G -->|はい| I[5秒待機して再確認]
+    H -->|はい| I
+    I --> E
+    G -->|いいえ| J[バックアップ完了]
+    H -->|いいえ| J
+    J --> K[finally でスリープ抑止を解除]
+    K --> L[終了ログ出力]
+    L --> M[アプリケーション終了]
 ```
 
 ## ログ出力
@@ -108,8 +113,8 @@ flowchart TD
 ```text
 2026-07-31 01:00:00 [INFO] アプリケーションを開始しました
 2026-07-31 01:00:00 [INFO] スリープ抑止を有効化しました
-2026-07-31 01:00:01 [INFO] バックアップを開始しました: sdclt.exe /backupnow
-2026-07-31 01:00:06 [INFO] バックアップ監視中: wbengine.exe 実行中
+2026-07-31 01:00:01 [INFO] バックアップを開始しました: sdclt.exe /kickoffjob
+2026-07-31 01:00:06 [INFO] バックアップ監視中: バックアップ処理 実行中
 2026-07-31 01:12:41 [INFO] バックアップ完了を検知しました
 2026-07-31 01:12:41 [INFO] スリープ抑止を解除しました
 2026-07-31 01:12:41 [INFO] アプリケーションを終了します
@@ -122,7 +127,7 @@ flowchart TD
 | 1 | INFO | アプリケーションを開始しました |
 | 2 | INFO | スリープ抑止を有効化しました |
 | 3 | INFO | バックアップを開始しました: `{command}` |
-| 4 | INFO | バックアップ監視中: `{process_name}` 実行中 |
+| 4 | INFO | バックアップ監視中: バックアップ処理 実行中 |
 | 5 | INFO | バックアップ完了を検知しました |
 | 6 | ERROR | バックアップ開始に失敗しました: `{error_message}` |
 | 7 | ERROR | 監視中にエラーが発生しました: `{error_message}` |
@@ -147,14 +152,14 @@ flowchart TD
 
 ### 開発環境
 
-- VSCode 1.100.3
+- VSCode 1.130.0
 - Windows PowerShell 5.1
 
 ### 検証環境
 
 | 項目 | 内容 |
 | ---- | ---- |
-| CPU | Intel64 Family 6 Model 154 Stepping 3 |
+| CPU | Intel64 Family 6 Model 198 Stepping 2 GenuineIntel ~2400 Mhz |
 | メモリー | 16 GB |
 | OS | Windows 11 |
 | PowerShell | 5.1 |
