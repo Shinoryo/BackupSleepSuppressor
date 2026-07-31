@@ -32,7 +32,7 @@ function GetWbadminStatus {
         $statusText = (& wbadmin get status 2>&1 | Out-String)
     } catch {
         return [PSCustomObject]@{
-            IsRunning = $false
+            State = 'Unknown'
             IsAvailable = $false
             StatusText = $_.Exception.Message
         }
@@ -40,7 +40,7 @@ function GetWbadminStatus {
 
     if ($LASTEXITCODE -ne 0) {
         return [PSCustomObject]@{
-            IsRunning = $false
+            State = 'Unknown'
             IsAvailable = $false
             StatusText = $statusText.Trim()
         }
@@ -48,7 +48,7 @@ function GetWbadminStatus {
 
     if ($statusText -match '(?i)no\s+operation\s+in\s+progress' -or $statusText -match '実行中の操作はありません') {
         return [PSCustomObject]@{
-            IsRunning = $false
+            State = 'NotRunning'
             IsAvailable = $true
             StatusText = $statusText.Trim()
         }
@@ -56,14 +56,14 @@ function GetWbadminStatus {
 
     if ($statusText -match '(?i)in\s+progress' -or $statusText -match '実行中') {
         return [PSCustomObject]@{
-            IsRunning = $true
+            State = 'Running'
             IsAvailable = $true
             StatusText = $statusText.Trim()
         }
     }
 
     return [PSCustomObject]@{
-        IsRunning = $false
+        State = 'Unknown'
         IsAvailable = $true
         StatusText = $statusText.Trim()
     }
@@ -71,12 +71,31 @@ function GetWbadminStatus {
 
 function TestBackupActive {
     $wbadminStatus = GetWbadminStatus
-    if ($wbadminStatus.IsAvailable) {
-        return $wbadminStatus.IsRunning
+    if ($wbadminStatus.State -eq 'Running' -or $wbadminStatus.State -eq 'NotRunning') {
+        return [PSCustomObject]@{
+            PrimaryState = $wbadminStatus.State
+            EffectiveState = $wbadminStatus.State
+            Source = 'wbadmin'
+            StatusText = $wbadminStatus.StatusText
+        }
     }
 
-    # wbadmin が使用できない場合のみプロセス監視にフォールバックする
-    return (TestBackupEngineActive)
+    # wbadmin 判定が Unknown の場合のみプロセス監視にフォールバックする
+    if (TestBackupEngineActive) {
+        return [PSCustomObject]@{
+            PrimaryState = 'Unknown'
+            EffectiveState = 'Running'
+            Source = 'wbengine'
+            StatusText = $wbadminStatus.StatusText
+        }
+    }
+
+    return [PSCustomObject]@{
+        PrimaryState = 'Unknown'
+        EffectiveState = 'NotRunning'
+        Source = 'wbengine'
+        StatusText = $wbadminStatus.StatusText
+    }
 }
 
 function WriteLogLine {
@@ -192,29 +211,36 @@ try {
     $phase = 'waitBackupProcessStart'
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     while ($stopwatch.Elapsed.TotalSeconds -lt $backupStartupTimeoutSeconds) {
-        if (TestBackupActive) {
+        $backupState = TestBackupActive
+        if ($backupState.EffectiveState -eq 'Running') {
             break
         }
 
         Start-Sleep -Seconds 1
     }
 
-    if (-not (TestBackupActive)) {
-        $wbadminStatus = GetWbadminStatus
-        if ($wbadminStatus.IsAvailable) {
-            throw ("バックアップジョブの開始を {0} 秒以内に確認できませんでした。wbadmin 状態: {1}" -f $backupStartupTimeoutSeconds, $wbadminStatus.StatusText)
+    $finalBackupState = TestBackupActive
+    if ($finalBackupState.EffectiveState -ne 'Running') {
+        if ($finalBackupState.PrimaryState -eq 'Unknown') {
+            throw ("バックアップジョブの開始を {0} 秒以内に確認できませんでした。wbadmin 判定不可、wbengine 未検出。wbadmin 状態: {1}" -f $backupStartupTimeoutSeconds, $finalBackupState.StatusText)
         }
 
-        throw ("バックアップジョブの開始を {0} 秒以内に確認できませんでした。wbadmin 状態取得不可: {1}" -f $backupStartupTimeoutSeconds, $wbadminStatus.StatusText)
+        throw ("バックアップジョブの開始を {0} 秒以内に確認できませんでした。wbadmin 状態: {1}" -f $backupStartupTimeoutSeconds, $finalBackupState.StatusText)
     }
 
     $phase = 'monitorBackupProcess'
     while ($true) {
-        if (-not (TestBackupActive)) {
+        $backupState = TestBackupActive
+        if ($backupState.EffectiveState -ne 'Running') {
             break
         }
 
-        & $writeLog -Level 'INFO' -Message 'バックアップ監視中: バックアップ処理 実行中'
+        if ($backupState.Source -eq 'wbengine') {
+            & $writeLog -Level 'INFO' -Message 'バックアップ監視中: wbadmin 判定不可のため wbengine を使用して監視中'
+        } else {
+            & $writeLog -Level 'INFO' -Message 'バックアップ監視中: バックアップ処理 実行中'
+        }
+
         Start-Sleep -Seconds $monitorIntervalSeconds
     }
 
