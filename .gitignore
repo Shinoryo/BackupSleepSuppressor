@@ -1,0 +1,5 @@
+﻿# Do not commit local Copilot customization assets
+.github/skills/
+.github/instructions/
+.github/agents/
+logs/
