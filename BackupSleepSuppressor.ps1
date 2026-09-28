@@ -14,7 +14,11 @@ $logFilePath = Join-Path -Path $logsDirectoryPath -ChildPath ("app_{0}.log" -f (
 $monitorIntervalSeconds = 5
 $backupCommand = 'sdclt.exe /kickoffjob'
 $backupProcessName = 'wbengine'
-$backupStartupTimeoutSeconds = 300
+$backupEngineHintTimeoutSeconds = 300
+$backupStartEventTimeoutSeconds = 1200
+$backupMonitorTimeoutSeconds = 10800
+
+Import-Module -Name (Join-Path -Path $scriptRoot -ChildPath 'BackupMonitoring.psm1') -Force -ErrorAction Stop
 
 function TestBackupEngineActive {
     $runningEngineProcess = Get-Process -Name $backupProcessName -ErrorAction SilentlyContinue
@@ -23,79 +27,6 @@ function TestBackupEngineActive {
     }
 
     return $false
-}
-
-function GetWbadminStatus {
-    $statusText = ''
-
-    try {
-        $statusText = (& wbadmin get status 2>&1 | Out-String)
-    } catch {
-        return [PSCustomObject]@{
-            State = 'Unknown'
-            IsAvailable = $false
-            StatusText = $_.Exception.Message
-        }
-    }
-
-    if ($LASTEXITCODE -ne 0) {
-        return [PSCustomObject]@{
-            State = 'Unknown'
-            IsAvailable = $false
-            StatusText = $statusText.Trim()
-        }
-    }
-
-    if ($statusText -match '(?i)no\s+operation\s+in\s+progress' -or $statusText -match '実行中の操作はありません') {
-        return [PSCustomObject]@{
-            State = 'NotRunning'
-            IsAvailable = $true
-            StatusText = $statusText.Trim()
-        }
-    }
-
-    if ($statusText -match '(?i)in\s+progress' -or $statusText -match '実行中') {
-        return [PSCustomObject]@{
-            State = 'Running'
-            IsAvailable = $true
-            StatusText = $statusText.Trim()
-        }
-    }
-
-    return [PSCustomObject]@{
-        State = 'Unknown'
-        IsAvailable = $true
-        StatusText = $statusText.Trim()
-    }
-}
-
-function TestBackupActive {
-    $wbadminStatus = GetWbadminStatus
-    if ($wbadminStatus.State -eq 'Running' -or $wbadminStatus.State -eq 'NotRunning') {
-        return [PSCustomObject]@{
-            PrimaryState = $wbadminStatus.State
-            EffectiveState = $wbadminStatus.State
-            Source = 'wbadmin'
-            StatusText = $wbadminStatus.StatusText
-        }
-    }
-
-    # wbadmin 判定が Unknown の場合のみプロセス監視にフォールバックする
-    if (TestBackupEngineActive) {
-        return [PSCustomObject]@{
-            PrimaryState = 'Unknown'
-            EffectiveState = 'Running'
-            Source = 'wbengine'
-            StatusText = $wbadminStatus.StatusText
-        }
-    }
-
-    return [PSCustomObject]@{
-        PrimaryState = 'Unknown'
-        EffectiveState = 'NotRunning'
-        Source = 'wbengine'
-        StatusText = $wbadminStatus.StatusText
-    }
 }
 
 function WriteLogLine {
@@ -194,6 +125,10 @@ $isSleepSuppressionEnabled = $false
 try {
     & $assertAdministrator
 
+    $phase = 'captureBackupEventCheckpoint'
+    $backupEventRecordId = GetBackupEventCheckpoint
+    & $writeLog -Level 'INFO' -Message ("Windows Backupイベント監視を準備しました: RecordId={0}" -f $backupEventRecordId)
+
     $phase = 'enableSleepSuppression'
     $executionStateFlags = [uint32]($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED)
     $setResult = [PowerStateNativeMethods]::SetThreadExecutionState($executionStateFlags)
@@ -205,50 +140,76 @@ try {
     & $writeLog -Level 'INFO' -Message 'スリープ抑止を有効化しました'
 
     $phase = 'startBackup'
+    $backupRequestedAt = [DateTimeOffset]::Now
+    $backupStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     Start-Process -FilePath 'sdclt.exe' -ArgumentList '/kickoffjob' -WindowStyle Hidden
     & $writeLog -Level 'INFO' -Message ("バックアップを開始しました: {0}" -f $backupCommand)
 
-    $phase = 'waitBackupProcessStart'
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($stopwatch.Elapsed.TotalSeconds -lt $backupStartupTimeoutSeconds) {
-        $backupState = TestBackupActive
-        if ($backupState.EffectiveState -eq 'Running') {
-            break
-        }
-
-        Start-Sleep -Seconds 1
-    }
-
-    $finalBackupState = TestBackupActive
-    if ($finalBackupState.EffectiveState -ne 'Running') {
-        if ($finalBackupState.PrimaryState -eq 'Unknown') {
-            throw ("バックアップジョブの開始を {0} 秒以内に確認できませんでした。wbadmin 判定不可、wbengine 未検出。wbadmin 状態: {1}" -f $backupStartupTimeoutSeconds, $finalBackupState.StatusText)
-        }
-
-        throw ("バックアップジョブの開始を {0} 秒以内に確認できませんでした。wbadmin 状態: {1}" -f $backupStartupTimeoutSeconds, $finalBackupState.StatusText)
-    }
-
     $phase = 'monitorBackupProcess'
+    $hasObservedBackupEngine = $false
+    $hasLoggedEngineDetectionTimeout = $false
+    $lastLoggedMonitorState = ''
     while ($true) {
-        $backupState = TestBackupActive
-        if ($backupState.EffectiveState -ne 'Running') {
+        $backupEvents = GetBackupEventsAfterRecordId -RecordId $backupEventRecordId
+        if (-not $hasObservedBackupEngine -and (TestBackupEngineActive)) {
+            $hasObservedBackupEngine = $true
+            & $writeLog -Level 'INFO' -Message 'wbengineを検知しました。イベントID 1で対象バックアップを確認します'
+        }
+
+        $elapsedSeconds = $backupStopwatch.Elapsed.TotalSeconds
+        $backupDecision = GetBackupMonitorDecision `
+            -Events $backupEvents `
+            -RecordIdBaseline $backupEventRecordId `
+            -RequestStartedAt $backupRequestedAt `
+            -ElapsedSeconds $elapsedSeconds `
+            -StartEventTimeoutSeconds $backupStartEventTimeoutSeconds `
+            -OverallTimeoutSeconds $backupMonitorTimeoutSeconds
+
+        if ($backupDecision.State -eq 'Succeeded') {
+            $terminalEvent = $backupDecision.TerminalEvent
+            $templateId = $terminalEvent.Data['BackupTemplateID']
+            $backupTime = $terminalEvent.Data['BackupTime']
+            $backupTarget = $terminalEvent.Data['BackupTarget']
+            & $writeLog -Level 'INFO' -Message ("バックアップの正常終了をイベントで確認しました: TemplateID={0}, BackupTarget={1}, BackupTime(UTC)={2}" -f $templateId, $backupTarget, $backupTime)
+            $exitCode = 0
             break
         }
 
-        if ($backupState.Source -eq 'wbengine') {
-            & $writeLog -Level 'INFO' -Message 'バックアップ監視中: wbadmin 判定不可のため wbengine を使用して監視中'
-        } else {
-            & $writeLog -Level 'INFO' -Message 'バックアップ監視中: バックアップ処理 実行中'
+        if ($backupDecision.State -eq 'Failed' -or $backupDecision.State -eq 'Ambiguous' -or $backupDecision.State -eq 'StartTimedOut' -or $backupDecision.State -eq 'TimedOut') {
+            $terminalEvent = $backupDecision.TerminalEvent
+            if ($null -ne $terminalEvent) {
+                $templateId = $terminalEvent.Data['BackupTemplateID']
+                $hresult = $terminalEvent.Data['HRESULT']
+                $detailedHResult = $terminalEvent.Data['DetailedHRESULT']
+                throw ("{0} EventId={1}, TemplateID={2}, HRESULT={3}, DetailedHRESULT={4}" -f $backupDecision.Message, $terminalEvent.Id, $templateId, $hresult, $detailedHResult)
+            }
+
+            throw $backupDecision.Message
+        }
+
+        if ($backupDecision.State -eq 'WaitingForStart' -and -not $hasObservedBackupEngine -and -not $hasLoggedEngineDetectionTimeout -and $elapsedSeconds -ge $backupEngineHintTimeoutSeconds) {
+            & $writeLog -Level 'WARN' -Message ("{0} 秒以内にwbengineを検知できませんでした。開始イベントの確認を継続します" -f $backupEngineHintTimeoutSeconds)
+            $hasLoggedEngineDetectionTimeout = $true
+        }
+
+        if ($backupDecision.State -ne $lastLoggedMonitorState) {
+            if ($backupDecision.State -eq 'WaitingForStart') {
+                & $writeLog -Level 'INFO' -Message '今回のバックアップ開始イベントを待機中です'
+            } else {
+                $templateId = $backupDecision.StartEvent.Data['BackupTemplateID']
+                & $writeLog -Level 'INFO' -Message ("バックアップ監視中: TemplateID={0} の終了イベントを待機中です" -f $templateId)
+            }
+
+            $lastLoggedMonitorState = $backupDecision.State
         }
 
         Start-Sleep -Seconds $monitorIntervalSeconds
     }
-
-    & $writeLog -Level 'INFO' -Message 'バックアップ完了を検知しました'
-    $exitCode = 0
 } catch {
     if ($phase -eq 'startBackup' -or $phase -eq 'waitBackupProcessStart') {
         & $writeLog -Level 'ERROR' -Message ("バックアップ開始に失敗しました: {0}" -f $_.Exception.Message)
+    } elseif ($phase -eq 'captureBackupEventCheckpoint') {
+        & $writeLog -Level 'ERROR' -Message ("Windows Backupイベント監視を準備できませんでした: {0}" -f $_.Exception.Message)
     } elseif ($phase -eq 'monitorBackupProcess') {
         & $writeLog -Level 'ERROR' -Message ("監視中にエラーが発生しました: {0}" -f $_.Exception.Message)
     } else {

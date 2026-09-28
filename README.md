@@ -8,6 +8,7 @@ Windows バックアップの実行中にシステムのスリープを抑止し
 - Windows PowerShell 5.1
 - 管理者権限
 - Windows バックアップが利用でき、バックアップジョブが設定されていること
+- `Microsoft-Windows-Backup` イベントログが有効で、管理者から読み取れること
 
 ## 実行
 
@@ -24,7 +25,10 @@ Windows バックアップの実行中にシステムのスリープを抑止し
 ## 動作とログ
 
 - `sdclt.exe /kickoffjob` でバックアップを開始します。
-- `wbadmin get status` で状態を監視し、判定できない場合は `wbengine.exe` の稼働状態を使います。
+- `wbengine.exe` は起動の早期検知にだけ使い、完了判定には使いません。
+- `Microsoft-Windows-Backup` の開始イベント ID 1 と終端イベント ID 4/14/5 を照合します。対象ジョブは `BackupTemplateID`、`BackupTime`、バックアップ先、HRESULTで特定します。
+- 正常終了は HRESULT と DetailedHRESULT が 0 で BackupState が 14 の場合です。イベント ID 5 または失敗HRESULTはエラーとして扱います。
+- 開始イベントは起動後20分、バックアップ全体は3時間を上限に監視します。イベントログを読めない、対象を特定できない、または期限を超えた場合は成功扱いにせず、終了コード1で終了します。
 - ログは `logs/app_yyyyMMdd.log` に出力します。
 - 正常終了・エラー終了のどちらでも、終了時にスリープ抑止の解除を試みます。
 
